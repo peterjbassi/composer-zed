@@ -80,7 +80,7 @@ impl ComposerLsp {
         versions
     }
 
-    fn parse_lock_file(&self, lock_path: &PathBuf) -> HashMap<String, String> {
+    fn parse_lock_file(&self, lock_path: &std::path::Path) -> HashMap<String, String> {
         let content = match std::fs::read_to_string(lock_path) {
             Ok(c) => c,
             Err(_) => return HashMap::new(),
