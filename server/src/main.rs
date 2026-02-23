@@ -1,45 +1,95 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::time::{Instant, SystemTime};
 
 use serde_json::Value;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
+struct VersionCache {
+    versions: HashMap<String, String>,
+    lock_path: PathBuf,
+    lock_mtime: SystemTime,
+    fetched_at: Instant,
+}
+
 struct ComposerLsp {
-    #[allow(dead_code)]
-    client: Client,
     workspace_root: Mutex<Option<PathBuf>>,
     documents: Mutex<HashMap<Url, String>>,
+    cache: Mutex<Option<VersionCache>>,
 }
 
 impl ComposerLsp {
-    fn new(client: Client) -> Self {
+    fn new(_client: Client) -> Self {
         Self {
-            client,
             workspace_root: Mutex::new(None),
             documents: Mutex::new(HashMap::new()),
+            cache: Mutex::new(None),
         }
     }
 
-    fn read_lock_file(&self, composer_json_uri: &Url) -> Option<Value> {
+    fn resolve_lock_path(&self, composer_json_uri: &Url) -> Option<PathBuf> {
         if let Ok(json_path) = composer_json_uri.to_file_path() {
             let lock_path = json_path.with_file_name("composer.lock");
-            if let Ok(content) = std::fs::read_to_string(&lock_path) {
-                if let Ok(parsed) = serde_json::from_str(&content) {
-                    return Some(parsed);
-                }
+            if lock_path.exists() {
+                return Some(lock_path);
             }
         }
 
         let root = self.workspace_root.lock().ok()?.clone()?;
         let lock_path = root.join("composer.lock");
-        let content = std::fs::read_to_string(lock_path).ok()?;
-        serde_json::from_str(&content).ok()
+        lock_path.exists().then_some(lock_path)
     }
 
-    fn build_version_map(&self, lock: &Value) -> HashMap<String, String> {
+    fn get_versions(&self, composer_json_uri: &Url) -> HashMap<String, String> {
+        let lock_path = match self.resolve_lock_path(composer_json_uri) {
+            Some(p) => p,
+            None => return HashMap::new(),
+        };
+
+        let mtime = lock_path
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+
+        // Return cached versions if the lock file hasn't changed and cache is < 5s old
+        if let Ok(cache) = self.cache.lock() {
+            if let Some(ref c) = *cache {
+                if c.lock_path == lock_path
+                    && c.lock_mtime == mtime
+                    && c.fetched_at.elapsed().as_secs() < 5
+                {
+                    return c.versions.clone();
+                }
+            }
+        }
+
+        let versions = self.parse_lock_file(&lock_path);
+
+        if let Ok(mut cache) = self.cache.lock() {
+            *cache = Some(VersionCache {
+                versions: versions.clone(),
+                lock_path,
+                lock_mtime: mtime,
+                fetched_at: Instant::now(),
+            });
+        }
+
+        versions
+    }
+
+    fn parse_lock_file(&self, lock_path: &PathBuf) -> HashMap<String, String> {
+        let content = match std::fs::read_to_string(lock_path) {
+            Ok(c) => c,
+            Err(_) => return HashMap::new(),
+        };
+        let lock: Value = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(_) => return HashMap::new(),
+        };
+
         let mut map = HashMap::new();
         for key in &["packages", "packages-dev"] {
             if let Some(packages) = lock.get(key).and_then(|v| v.as_array()) {
@@ -48,6 +98,7 @@ impl ComposerLsp {
                         pkg.get("name").and_then(|v| v.as_str()),
                         pkg.get("version").and_then(|v| v.as_str()),
                     ) {
+                        let version = version.strip_prefix('v').unwrap_or(version);
                         map.insert(name.to_string(), version.to_string());
                     }
                 }
@@ -57,11 +108,10 @@ impl ComposerLsp {
     }
 
     fn compute_hints(&self, uri: &Url, text: &str) -> Vec<InlayHint> {
-        let lock = match self.read_lock_file(uri) {
-            Some(l) => l,
-            None => return vec![],
-        };
-        let versions = self.build_version_map(&lock);
+        let versions = self.get_versions(uri);
+        if versions.is_empty() {
+            return vec![];
+        }
 
         let mut hints = Vec::new();
         let mut in_require_section = false;
@@ -82,8 +132,7 @@ impl ComposerLsp {
                 }
             }
 
-            let brace_delta = count_braces(trimmed);
-            brace_depth += brace_delta;
+            brace_depth += count_braces(trimmed);
 
             if in_require_section {
                 if brace_depth <= section_start_depth {
@@ -97,11 +146,10 @@ impl ComposerLsp {
                         None => "not installed".to_string(),
                     };
 
-                    let line_len = line.len() as u32;
                     hints.push(InlayHint {
                         position: Position {
                             line: line_idx as u32,
-                            character: line_len,
+                            character: line.len() as u32,
                         },
                         label: InlayHintLabel::String(version_text),
                         kind: None,
@@ -208,8 +256,7 @@ impl LanguageServer for ComposerLsp {
     async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
         let uri = &params.text_document.uri;
 
-        let path = uri.path();
-        if !path.ends_with("composer.json") {
+        if !uri.path().ends_with("composer.json") {
             return Ok(None);
         }
 
@@ -222,8 +269,7 @@ impl LanguageServer for ComposerLsp {
             None => return Ok(None),
         };
 
-        let hints = self.compute_hints(uri, &text);
-        Ok(Some(hints))
+        Ok(Some(self.compute_hints(uri, &text)))
     }
 
     async fn shutdown(&self) -> Result<()> {
