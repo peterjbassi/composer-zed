@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -7,16 +6,6 @@ use serde_json::Value;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
-
-fn log(msg: &str) {
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/composer-lsp.log")
-    {
-        let _ = writeln!(f, "{msg}");
-    }
-}
 
 struct ComposerLsp {
     #[allow(dead_code)]
@@ -37,7 +26,6 @@ impl ComposerLsp {
     fn read_lock_file(&self, composer_json_uri: &Url) -> Option<Value> {
         if let Ok(json_path) = composer_json_uri.to_file_path() {
             let lock_path = json_path.with_file_name("composer.lock");
-            log(&format!("trying lock file at: {}", lock_path.display()));
             if let Ok(content) = std::fs::read_to_string(&lock_path) {
                 if let Ok(parsed) = serde_json::from_str(&content) {
                     return Some(parsed);
@@ -47,7 +35,6 @@ impl ComposerLsp {
 
         let root = self.workspace_root.lock().ok()?.clone()?;
         let lock_path = root.join("composer.lock");
-        log(&format!("trying lock file at workspace root: {}", lock_path.display()));
         let content = std::fs::read_to_string(lock_path).ok()?;
         serde_json::from_str(&content).ok()
     }
@@ -66,17 +53,13 @@ impl ComposerLsp {
                 }
             }
         }
-        log(&format!("version map has {} entries", map.len()));
         map
     }
 
     fn compute_hints(&self, uri: &Url, text: &str) -> Vec<InlayHint> {
         let lock = match self.read_lock_file(uri) {
             Some(l) => l,
-            None => {
-                log("no composer.lock found");
-                return vec![];
-            }
+            None => return vec![],
         };
         let versions = self.build_version_map(&lock);
 
@@ -95,7 +78,6 @@ impl ComposerLsp {
                     in_require_section = true;
                     section_start_depth = brace_depth;
                     brace_depth += count_braces(trimmed);
-                    log(&format!("entered require section at line {}, depth {}", line_idx, brace_depth));
                     continue;
                 }
             }
@@ -105,17 +87,15 @@ impl ComposerLsp {
 
             if in_require_section {
                 if brace_depth <= section_start_depth {
-                    log(&format!("exited require section at line {}", line_idx));
                     in_require_section = false;
                     continue;
                 }
 
                 if let Some(package_name) = extract_package_name(trimmed) {
                     let version_text = match versions.get(&package_name) {
-                        Some(v) => format!("installed: {v}"),
+                        Some(v) => v.clone(),
                         None => "not installed".to_string(),
                     };
-                    log(&format!("hint for {}: {}", package_name, version_text));
 
                     let line_len = line.len() as u32;
                     hints.push(InlayHint {
@@ -176,25 +156,17 @@ fn extract_package_name(trimmed: &str) -> Option<String> {
 #[tower_lsp::async_trait]
 impl LanguageServer for ComposerLsp {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
-        log("=== initialize called ===");
-
         if let Some(root_uri) = params.root_uri.as_ref() {
             if let Ok(path) = root_uri.to_file_path() {
-                log(&format!("workspace root: {}", path.display()));
                 *self.workspace_root.lock().unwrap() = Some(path);
             }
         } else if let Some(folders) = params.workspace_folders.as_ref() {
             if let Some(folder) = folders.first() {
                 if let Ok(path) = folder.uri.to_file_path() {
-                    log(&format!("workspace root from folder: {}", path.display()));
                     *self.workspace_root.lock().unwrap() = Some(path);
                 }
             }
-        } else {
-            log("no workspace root provided");
         }
-
-        log("advertising inlayHintProvider capability");
 
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
@@ -208,12 +180,9 @@ impl LanguageServer for ComposerLsp {
         })
     }
 
-    async fn initialized(&self, _: InitializedParams) {
-        log("=== initialized ===");
-    }
+    async fn initialized(&self, _: InitializedParams) {}
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
-        log(&format!("didOpen: {}", params.text_document.uri));
         self.documents
             .lock()
             .unwrap()
@@ -221,7 +190,6 @@ impl LanguageServer for ComposerLsp {
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
-        log(&format!("didChange: {}", params.text_document.uri));
         if let Some(change) = params.content_changes.into_iter().last() {
             self.documents
                 .lock()
@@ -231,7 +199,6 @@ impl LanguageServer for ComposerLsp {
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
-        log(&format!("didClose: {}", params.text_document.uri));
         self.documents
             .lock()
             .unwrap()
@@ -240,11 +207,9 @@ impl LanguageServer for ComposerLsp {
 
     async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
         let uri = &params.text_document.uri;
-        log(&format!("inlayHint request for: {}", uri));
 
         let path = uri.path();
         if !path.ends_with("composer.json") {
-            log(&format!("skipping non-composer.json: {}", path));
             return Ok(None);
         }
 
@@ -254,26 +219,20 @@ impl LanguageServer for ComposerLsp {
         };
         let text = match text {
             Some(t) => t,
-            None => {
-                log("document not tracked yet");
-                return Ok(None);
-            }
+            None => return Ok(None),
         };
 
         let hints = self.compute_hints(uri, &text);
-        log(&format!("returning {} inlay hints", hints.len()));
         Ok(Some(hints))
     }
 
     async fn shutdown(&self) -> Result<()> {
-        log("shutdown");
         Ok(())
     }
 }
 
 #[tokio::main]
 async fn main() {
-    log("=== composer-lsp starting ===");
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
