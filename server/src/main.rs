@@ -248,15 +248,17 @@ impl LanguageServer for ComposerLsp {
             return Ok(None);
         }
 
-        let docs = self.documents.lock().unwrap();
-        let text = match docs.get(uri) {
-            Some(t) => t.clone(),
+        let text = {
+            let docs = self.documents.lock().unwrap();
+            docs.get(uri).cloned()
+        };
+        let text = match text {
+            Some(t) => t,
             None => {
                 self.log("document not found in tracked documents").await;
                 return Ok(None);
             }
         };
-        drop(docs);
 
         let lock_found = self.read_lock_file(uri).is_some();
         self.log(format!("composer.lock found: {}", lock_found)).await;
