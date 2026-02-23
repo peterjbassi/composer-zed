@@ -1,0 +1,11 @@
+[extension]
+id = "composer"
+name = "Composer"
+description = "Displays installed dependency versions from composer.lock as inlay hints in composer.json"
+version = "0.0.1"
+schema_version = 1
+authors = ["Peter"]
+
+[language_servers.composer-lsp]
+name = "Composer LSP"
+languages = ["JSON"]
