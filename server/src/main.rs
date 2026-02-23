@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -7,7 +8,18 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
+fn log(msg: &str) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/composer-lsp.log")
+    {
+        let _ = writeln!(f, "{msg}");
+    }
+}
+
 struct ComposerLsp {
+    #[allow(dead_code)]
     client: Client,
     workspace_root: Mutex<Option<PathBuf>>,
     documents: Mutex<HashMap<Url, String>>,
@@ -22,13 +34,10 @@ impl ComposerLsp {
         }
     }
 
-    /// Read composer.lock from the same directory as the given composer.json URI,
-    /// falling back to the workspace root.
     fn read_lock_file(&self, composer_json_uri: &Url) -> Option<Value> {
-        // Try sibling composer.lock first
         if let Ok(json_path) = composer_json_uri.to_file_path() {
             let lock_path = json_path.with_file_name("composer.lock");
-            eprintln!("trying lock file at: {}", lock_path.display());
+            log(&format!("trying lock file at: {}", lock_path.display()));
             if let Ok(content) = std::fs::read_to_string(&lock_path) {
                 if let Ok(parsed) = serde_json::from_str(&content) {
                     return Some(parsed);
@@ -36,15 +45,13 @@ impl ComposerLsp {
             }
         }
 
-        // Fall back to workspace root
         let root = self.workspace_root.lock().ok()?.clone()?;
         let lock_path = root.join("composer.lock");
-        eprintln!("trying lock file at workspace root: {}", lock_path.display());
+        log(&format!("trying lock file at workspace root: {}", lock_path.display()));
         let content = std::fs::read_to_string(lock_path).ok()?;
         serde_json::from_str(&content).ok()
     }
 
-    /// Build a map of package name -> installed version from composer.lock.
     fn build_version_map(&self, lock: &Value) -> HashMap<String, String> {
         let mut map = HashMap::new();
         for key in &["packages", "packages-dev"] {
@@ -59,17 +66,15 @@ impl ComposerLsp {
                 }
             }
         }
-        eprintln!("version map has {} entries", map.len());
+        log(&format!("version map has {} entries", map.len()));
         map
     }
 
-    /// Parse document text and return inlay hints for dependency lines
-    /// inside "require" and "require-dev" sections.
     fn compute_hints(&self, uri: &Url, text: &str) -> Vec<InlayHint> {
         let lock = match self.read_lock_file(uri) {
             Some(l) => l,
             None => {
-                eprintln!("no composer.lock found");
+                log("no composer.lock found");
                 return vec![];
             }
         };
@@ -83,7 +88,6 @@ impl ComposerLsp {
         for (line_idx, line) in text.lines().enumerate() {
             let trimmed = line.trim();
 
-            // Detect entering a require or require-dev section.
             if !in_require_section {
                 if (trimmed.starts_with("\"require\"") || trimmed.starts_with("\"require-dev\""))
                     && trimmed.contains('{')
@@ -91,7 +95,7 @@ impl ComposerLsp {
                     in_require_section = true;
                     section_start_depth = brace_depth;
                     brace_depth += count_braces(trimmed);
-                    eprintln!("entered require section at line {}, depth {}", line_idx, brace_depth);
+                    log(&format!("entered require section at line {}, depth {}", line_idx, brace_depth));
                     continue;
                 }
             }
@@ -101,7 +105,7 @@ impl ComposerLsp {
 
             if in_require_section {
                 if brace_depth <= section_start_depth {
-                    eprintln!("exited require section at line {}", line_idx);
+                    log(&format!("exited require section at line {}", line_idx));
                     in_require_section = false;
                     continue;
                 }
@@ -111,7 +115,7 @@ impl ComposerLsp {
                         Some(v) => format!("installed: {v}"),
                         None => "not installed".to_string(),
                     };
-                    eprintln!("hint for {}: {}", package_name, version_text);
+                    log(&format!("hint for {}: {}", package_name, version_text));
 
                     let line_len = line.len() as u32;
                     hints.push(InlayHint {
@@ -135,7 +139,6 @@ impl ComposerLsp {
     }
 }
 
-/// Count net brace changes in a line: +1 for '{', -1 for '}'.
 fn count_braces(line: &str) -> i32 {
     let mut count = 0i32;
     let mut in_string = false;
@@ -156,7 +159,6 @@ fn count_braces(line: &str) -> i32 {
     count
 }
 
-/// Extract the package name from a JSON line like `"vendor/package": "^1.0"`.
 fn extract_package_name(trimmed: &str) -> Option<String> {
     if !trimmed.starts_with('"') {
         return None;
@@ -174,23 +176,25 @@ fn extract_package_name(trimmed: &str) -> Option<String> {
 #[tower_lsp::async_trait]
 impl LanguageServer for ComposerLsp {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        log("=== initialize called ===");
+
         if let Some(root_uri) = params.root_uri.as_ref() {
             if let Ok(path) = root_uri.to_file_path() {
-                eprintln!("workspace root: {}", path.display());
+                log(&format!("workspace root: {}", path.display()));
                 *self.workspace_root.lock().unwrap() = Some(path);
             }
         } else if let Some(folders) = params.workspace_folders.as_ref() {
             if let Some(folder) = folders.first() {
                 if let Ok(path) = folder.uri.to_file_path() {
-                    eprintln!("workspace root from folder: {}", path.display());
+                    log(&format!("workspace root from folder: {}", path.display()));
                     *self.workspace_root.lock().unwrap() = Some(path);
                 }
             }
         } else {
-            eprintln!("no workspace root provided");
+            log("no workspace root provided");
         }
 
-        eprintln!("initialize complete, advertising inlayHintProvider");
+        log("advertising inlayHintProvider capability");
 
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
@@ -205,11 +209,11 @@ impl LanguageServer for ComposerLsp {
     }
 
     async fn initialized(&self, _: InitializedParams) {
-        eprintln!("Composer LSP initialized");
+        log("=== initialized ===");
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
-        eprintln!("didOpen: {}", params.text_document.uri);
+        log(&format!("didOpen: {}", params.text_document.uri));
         self.documents
             .lock()
             .unwrap()
@@ -217,7 +221,7 @@ impl LanguageServer for ComposerLsp {
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
-        eprintln!("didChange: {}", params.text_document.uri);
+        log(&format!("didChange: {}", params.text_document.uri));
         if let Some(change) = params.content_changes.into_iter().last() {
             self.documents
                 .lock()
@@ -227,7 +231,7 @@ impl LanguageServer for ComposerLsp {
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
-        eprintln!("didClose: {}", params.text_document.uri);
+        log(&format!("didClose: {}", params.text_document.uri));
         self.documents
             .lock()
             .unwrap()
@@ -236,11 +240,11 @@ impl LanguageServer for ComposerLsp {
 
     async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
         let uri = &params.text_document.uri;
-        eprintln!("inlayHint request for: {}", uri);
+        log(&format!("inlayHint request for: {}", uri));
 
         let path = uri.path();
         if !path.ends_with("composer.json") {
-            eprintln!("skipping non-composer.json: {}", path);
+            log(&format!("skipping non-composer.json: {}", path));
             return Ok(None);
         }
 
@@ -251,24 +255,25 @@ impl LanguageServer for ComposerLsp {
         let text = match text {
             Some(t) => t,
             None => {
-                eprintln!("document not tracked yet");
+                log("document not tracked yet");
                 return Ok(None);
             }
         };
 
         let hints = self.compute_hints(uri, &text);
-        eprintln!("returning {} inlay hints", hints.len());
+        log(&format!("returning {} inlay hints", hints.len()));
         Ok(Some(hints))
     }
 
     async fn shutdown(&self) -> Result<()> {
+        log("shutdown");
         Ok(())
     }
 }
 
 #[tokio::main]
 async fn main() {
-    eprintln!("composer-lsp starting");
+    log("=== composer-lsp starting ===");
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
