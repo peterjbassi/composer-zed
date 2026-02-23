@@ -1,4 +1,3 @@
-[extension]
 id = "composer"
 name = "Composer"
 description = "Displays installed dependency versions from composer.lock as inlay hints in composer.json"
